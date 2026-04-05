@@ -7,6 +7,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <vector>    
+#include <utility>
 
 #include "leveldb/export.h"
 #include "leveldb/iterator.h"
@@ -76,6 +78,14 @@ class LEVELDB_EXPORT DB {
   // Returns OK on success, non-OK on failure.
   // Note: consider setting options.sync = true.
   virtual Status Write(const WriteOptions& options, WriteBatch* updates) = 0;
+
+  // Scan returns all key-value pairs in the half-open interval [start_key, end_key).
+  // Results are returned in sorted key order.
+  // Returns an empty vector if no keys exist in the range.
+  virtual Status Scan(const ReadOptions& options,
+                      const Slice& start_key,
+                      const Slice& end_key,
+                      std::vector<std::pair<std::string, std::string>>* result) = 0;
 
   // If the database contains an entry for "key" store the
   // corresponding value in *value and return OK.

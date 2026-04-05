@@ -40,6 +40,10 @@ class DBImpl : public DB {
              const Slice& value) override;
   Status Delete(const WriteOptions&, const Slice& key) override;
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
+  Status Scan(const ReadOptions& options,
+              const Slice& start_key,
+              const Slice& end_key,
+              std::vector<std::pair<std::string, std::string>>* result) override;
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
   Iterator* NewIterator(const ReadOptions&) override;

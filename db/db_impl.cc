@@ -1466,6 +1466,65 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
   return false;
 }
 
+Status DBImpl::Scan(
+    const ReadOptions& options,
+    const Slice& start_key,
+    const Slice& end_key,
+    std::vector<std::pair<std::string, std::string>>* res) {
+    if (res== nullptr) {
+      return Status::InvalidArgument("res vector cannot be null");
+    }
+    res->clear();
+
+  //  Validate that start_key < end_key
+  // If start >= end, the range is empty by definition.
+  if (user_comparator()->Compare(start_key, end_key) >= 0) {
+    return Status::OK();     // Empty or invalid range — return empty result, no error
+  }
+
+  // Create our main iterator.
+  // The thing about NewIterator() is that it hides all 
+  // the messy internal details from us. It automatically connects
+  // together the memory data and the disk files, skips over 
+  // any deleted keys, and only hands us the latest versions. 
+  // Basically don't worry about the internal mechanics
+  Iterator* iter = NewIterator(options);
+
+  // Find the start of the range
+  // Seek() positions the iterator at the first key >= start_key.
+  // If start_key doesn't exist, it goes on the next key after it.
+  iter->Seek(start_key);
+
+  // collect all keys in [start_key, end_key)
+  // loop condition:
+  // iter->Valid(): iterator hasn't gone past the end of data
+  // Compare(key, end_key) < 0: current key is strictly less than end_key
+  //  (half-open interval means end_key itself is excluded)
+  Status status;
+
+  while (iter->Valid()) {
+    Slice current_key = iter->key();
+
+    // stop if we've reached or passed end_key (half-open interval)
+    if (user_comparator()->Compare(current_key, end_key) >= 0) {
+      break;
+    }
+    // add the key-value pair to results
+    res->emplace_back(current_key.ToString(), iter->value().ToString());
+
+    iter->Next();
+  }
+  // check if iteration ended due to an error
+  if (iter->status().ok() == false) {
+    status = iter->status();
+    res->clear();  // don't return corrupted results
+  }
+  //Clean up the iterator
+  delete iter;
+
+  return status;
+}
+
 void DBImpl::GetApproximateSizes(const Range* range, int n, uint64_t* sizes) {
   // TODO(opt): better implementation
   MutexLock l(&mutex_);

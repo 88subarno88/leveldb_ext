@@ -2120,6 +2120,10 @@ class ModelDB : public DB {
   Status Delete(const WriteOptions& o, const Slice& key) override {
     return DB::Delete(o, key);
   }
+  Status Scan(const ReadOptions& options, const Slice& start_key,
+              const Slice& end_key,std::vector<std::pair<std::string, std::string>>* result) override {
+        return Status::NotSupported("Scan is not supported in ModelDB");
+  }
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override {
     assert(false);  // Not implemented
