@@ -1,0 +1,3 @@
+[submodule "leveldb"]
+	path = leveldb
+	url = https://github.com/88subarno88/leveldb_ext.git
