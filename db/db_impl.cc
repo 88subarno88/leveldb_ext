@@ -979,7 +979,11 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         // Therefore this deletion marker is obsolete and can be dropped.
         drop = true;
       }
-
+      if (!drop && ikey.type == kTypeValue) {
+        if (IsKeyInRangeDeletion(ikey.user_key)) {
+          drop = true;
+        }
+      }
       last_sequence_for_key = ikey.sequence;
     }
 #if 0
@@ -1634,5 +1638,130 @@ Status DestroyDB(const std::string& dbname, const Options& options) {
   }
   return result;
 }
+bool DBImpl::IsKeyInRangeDeletion(const Slice& user_key) {
+  for (const RangeDeletion& rd : range_deletions_) {
+    bool after_start = user_comparator()->Compare(user_key, rd.start_key) >= 0;
+    bool before_end  = user_comparator()->Compare(user_key, rd.end_key)   <  0;
+    if (after_start && before_end) return true;
+  }
+  return false;
+}
 
+Status DBImpl::DeleteRange(const WriteOptions& options,
+                           const Slice& start_key,
+                           const Slice& end_key) {
+  if (user_comparator()->Compare(start_key, end_key) >= 0) {
+    return Status::OK();
+  }
+
+  // Phase 1: Write tombstones for all currently visible keys in range
+  {
+    Iterator* iter = NewIterator(ReadOptions());
+    iter->Seek(start_key);
+    WriteBatch batch;
+    while (iter->Valid()) {
+      Slice key = iter->key();
+      if (user_comparator()->Compare(key, end_key) >= 0) break;
+      batch.Delete(key);
+      iter->Next();
+    }
+    Status iter_status = iter->status();
+    delete iter;
+    if (!iter_status.ok()) return iter_status;
+    Status s = Write(options, &batch);
+    if (!s.ok()) return s;
+  }
+
+  // Phase 2: Record range so compaction drops matching SSTable keys
+  {
+    MutexLock l(&mutex_);
+    range_deletions_.emplace_back(start_key.ToString(), end_key.ToString());
+  }
+
+  {
+    MutexLock l(&mutex_);
+    MaybeScheduleCompaction();
+  }
+  return Status::OK();
+}
+
+Status DBImpl::ForceFullCompaction() {
+  int     num_compactions    = 0;
+  int     total_input_files  = 0;
+  int     total_output_files = 0;
+  int64_t bytes_read         = 0;
+  int64_t bytes_written      = 0;
+
+  // Step 1: Flush MemTable to disk
+  {
+    MutexLock l(&mutex_);
+    if (mem_->ApproximateMemoryUsage() > 0) {
+      imm_ = mem_;
+      has_imm_.store(true, std::memory_order_release);
+      mem_ = new MemTable(internal_comparator_);
+      mem_->Ref();
+      MaybeScheduleCompaction();
+      while (imm_ != nullptr && bg_error_.ok()) {
+        background_work_finished_signal_.Wait();
+      }
+      if (!bg_error_.ok()) return bg_error_;
+    }
+  }
+
+  // Step 2: Compact L0 -> Lmax-1 sequentially
+  for (int level = 0; level < config::kNumLevels - 1; level++) {
+    int     files_in  = 0;
+    int64_t br_before = 0, bw_before = 0;
+    {
+      MutexLock l(&mutex_);
+      if (versions_->current()->NumFiles(level) == 0) continue;
+      files_in  = versions_->current()->NumFiles(level);
+      br_before = stats_[level + 1].bytes_read;
+      bw_before = stats_[level + 1].bytes_written;
+    }
+    TEST_CompactRange(level, nullptr, nullptr);
+    {
+      MutexLock l(&mutex_);
+      if (!bg_error_.ok()) return bg_error_;
+      int64_t dr = stats_[level + 1].bytes_read    - br_before;
+      int64_t dw = stats_[level + 1].bytes_written - bw_before;
+      if (dr > 0 || dw > 0) {
+        num_compactions++;
+        bytes_read         += dr;
+        bytes_written      += dw;
+        total_input_files  += files_in;
+        total_output_files += versions_->current()->NumFiles(level + 1);
+      }
+    }
+  }
+
+  // Step 3: Second pass for stragglers
+  for (int level = 0; level < config::kNumLevels - 1; level++) {
+    { MutexLock l(&mutex_); if (versions_->current()->NumFiles(level) == 0) continue; }
+    TEST_CompactRange(level, nullptr, nullptr);
+    { MutexLock l(&mutex_); if (!bg_error_.ok()) return bg_error_; }
+  }
+
+  // Step 4: Print stats
+  auto fmt = [](int64_t b) -> std::string {
+    char buf[64];
+    if      (b >= (1LL<<30)) snprintf(buf,sizeof(buf),"%.2f GB",b/double(1LL<<30));
+    else if (b >= (1LL<<20)) snprintf(buf,sizeof(buf),"%.2f MB",b/double(1LL<<20));
+    else if (b >= (1LL<<10)) snprintf(buf,sizeof(buf),"%.2f KB",b/double(1LL<<10));
+    else                     snprintf(buf,sizeof(buf),"%lld B",(long long)b);
+    return std::string(buf);
+  };
+
+  fprintf(stdout,"\n========================================\n");
+  fprintf(stdout,"   ForceFullCompaction Statistics\n");
+  fprintf(stdout,"========================================\n");
+  fprintf(stdout,"  Compaction rounds   : %d\n", num_compactions);
+  fprintf(stdout,"  Total input files   : %d\n", total_input_files);
+  fprintf(stdout,"  Total output files  : %d\n", total_output_files);
+  fprintf(stdout,"  Total bytes read    : %s\n", fmt(bytes_read).c_str());
+  fprintf(stdout,"  Total bytes written : %s\n", fmt(bytes_written).c_str());
+  fprintf(stdout,"========================================\n\n");
+
+  return Status::OK();
+}
 }  // namespace leveldb

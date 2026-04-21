@@ -46,6 +46,11 @@ class DBImpl : public DB {
               std::vector<std::pair<std::string, std::string>>* result) override;
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
+
+  Status DeleteRange(const WriteOptions& options, const Slice& start_key,
+                     const Slice& end_key) override;
+  Status ForceFullCompaction() override;
+
   Iterator* NewIterator(const ReadOptions&) override;
   const Snapshot* GetSnapshot() override;
   void ReleaseSnapshot(const Snapshot* snapshot) override;
@@ -80,6 +85,16 @@ class DBImpl : public DB {
   struct CompactionState;
   struct Writer;
 
+  // Stores active range deletions, checked during compaction
+  struct RangeDeletion {
+    std::string start_key;
+    std::string end_key;
+    RangeDeletion(const std::string& s, const std::string& e)
+        : start_key(s), end_key(e) {}
+  };
+  bool IsKeyInRangeDeletion(const Slice& user_key);
+  std::vector<RangeDeletion> range_deletions_ ;
+  
   // Information for a manual compaction
   struct ManualCompaction {
     int level;

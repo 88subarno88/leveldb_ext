@@ -115,6 +115,14 @@ class LEVELDB_EXPORT DB {
   // use "snapshot" after this call.
   virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
 
+  // DeleteRange removes all key-value pairs in [start_key, end_key).
+  virtual Status DeleteRange(const WriteOptions& options,
+    const Slice& start_key,
+    const Slice& end_key) = 0;
+
+// ForceFullCompaction triggers synchronous full compaction across all levels.
+virtual Status ForceFullCompaction() = 0;
+
   // DB implementations can export properties about their state
   // via this method.  If "property" is a valid property understood by this
   // DB implementation, fills "*value" with its current value and returns

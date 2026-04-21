@@ -2129,6 +2129,12 @@ class ModelDB : public DB {
     assert(false);  // Not implemented
     return Status::NotFound(key);
   }
+  Status DeleteRange(const WriteOptions& options, const Slice& start_key,
+                     const Slice& end_key) override {
+    return Status::OK();
+  }
+
+  Status ForceFullCompaction() override { return Status::OK(); }
   Iterator* NewIterator(const ReadOptions& options) override {
     if (options.snapshot == nullptr) {
       KVMap* saved = new KVMap;
