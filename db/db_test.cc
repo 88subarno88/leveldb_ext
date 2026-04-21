@@ -2111,6 +2111,9 @@ class ModelDB : public DB {
    public:
     KVMap map_;
   };
+  Status DeleteRange(const WriteOptions& options, const Slice& startkey, const Slice& endkey) override {
+    return Status::OK();
+  }
 
   explicit ModelDB(const Options& options) : options_(options) {}
   ~ModelDB() override = default;
