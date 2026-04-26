@@ -147,7 +147,8 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)) {}
+                         &internal_comparator_)),
+      force_compaction_in_progress_(false) {}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -897,7 +898,7 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
 
 Status DBImpl::DoCompactionWork(CompactionState* compact) {
   const uint64_t start_micros = env_->NowMicros();
-  int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
+  int64_t imm_micros = 0;
 
   Log(options_.info_log, "Compacting %d@%d + %d@%d files",
       compact->compaction->num_input_files(0), compact->compaction->level(),
@@ -907,6 +908,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
   assert(compact->builder == nullptr);
   assert(compact->outfile == nullptr);
+
   if (snapshots_.empty()) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
@@ -915,7 +917,12 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
 
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
 
-  // Release mutex while we're actually doing the compaction work
+  // Snapshot range_deletions_ before releasing mutex.
+  // range_deletions_ is GUARDED_BY(mutex_) so we cannot safely
+  // access it after Unlock(). We copy it now while still holding the lock.
+  std::vector<RangeDeletion> local_range_deletions = range_deletions_;
+
+  // Release mutex while doing the actual compaction work
   mutex_.Unlock();
 
   input->SeekToFirst();
@@ -924,14 +931,15 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   std::string current_user_key;
   bool has_current_user_key = false;
   SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
+
   while (input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
-    // Prioritize immutable compaction work
+
+    // Prioritize immutable memtable compaction
     if (has_imm_.load(std::memory_order_relaxed)) {
       const uint64_t imm_start = env_->NowMicros();
       mutex_.Lock();
       if (imm_ != nullptr) {
         CompactMemTable();
-        // Wake up MakeRoomForWrite() if necessary.
         background_work_finished_signal_.SignalAll();
       }
       mutex_.Unlock();
@@ -942,67 +950,53 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     if (compact->compaction->ShouldStopBefore(key) &&
         compact->builder != nullptr) {
       status = FinishCompactionOutputFile(compact, input);
-      if (!status.ok()) {
-        break;
-      }
+      if (!status.ok()) break;
     }
 
-    // Handle key/value, add to state, etc.
     bool drop = false;
     if (!ParseInternalKey(key, &ikey)) {
-      // Do not hide error keys
       current_user_key.clear();
       has_current_user_key = false;
       last_sequence_for_key = kMaxSequenceNumber;
     } else {
       if (!has_current_user_key ||
-          user_comparator()->Compare(ikey.user_key, Slice(current_user_key)) !=
-              0) {
-        // First occurrence of this user key
+          user_comparator()->Compare(ikey.user_key,
+                                     Slice(current_user_key)) != 0) {
         current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
         has_current_user_key = true;
         last_sequence_for_key = kMaxSequenceNumber;
       }
 
       if (last_sequence_for_key <= compact->smallest_snapshot) {
-        // Hidden by an newer entry for same user key
+        // Hidden by newer entry for same user key
         drop = true;  // (A)
       } else if (ikey.type == kTypeDeletion &&
                  ikey.sequence <= compact->smallest_snapshot &&
                  compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
-        // For this user key:
-        // (1) there is no data in higher levels
-        // (2) data in lower levels will have larger sequence numbers
-        // (3) data in layers that are being compacted here and have
-        //     smaller sequence numbers will be dropped in the next
-        //     few iterations of this loop (by rule (A) above).
-        // Therefore this deletion marker is obsolete and can be dropped.
+        // Deletion tombstone with no older data below — safe to drop
         drop = true;
       }
-      if (!drop && ikey.type == kTypeValue) {
-        if (IsKeyInRangeDeletion(ikey.user_key)) {
-          drop = true;
-        }
-      }
-      last_sequence_for_key = ikey.sequence;
-    }
-#if 0
-    Log(options_.info_log,
-        "  Compact: %s, seq %d, type: %d %d, drop: %d, is_base: %d, "
-        "%d smallest_snapshot: %d",
-        ikey.user_key.ToString().c_str(),
-        (int)ikey.sequence, ikey.type, kTypeValue, drop,
-        compact->compaction->IsBaseLevelForKey(ikey.user_key),
-        (int)last_sequence_for_key, (int)compact->smallest_snapshot);
-#endif
 
-    if (!drop) {
-      // Open output file if necessary
-      if (compact->builder == nullptr) {
-        status = OpenCompactionOutputFile(compact);
-        if (!status.ok()) {
+      // Range deletion check — uses local snapshot of range_deletions_
+      // taken before mutex was released, so no lock needed here.
+      // Only drop kTypeValue entries — tombstones are handled above.
+     if (!drop && ikey.type == kTypeValue) {
+      for (const RangeDeletion& rd : local_range_deletions) {
+        if (user_comparator()->Compare(ikey.user_key, rd.start_key) >= 0 &&
+            user_comparator()->Compare(ikey.user_key, rd.end_key)   <  0) {
+          drop = true;
           break;
         }
+      }
+    }
+
+      last_sequence_for_key = ikey.sequence;
+    }
+
+    if (!drop) {
+      if (compact->builder == nullptr) {
+        status = OpenCompactionOutputFile(compact);
+        if (!status.ok()) break;
       }
       if (compact->builder->NumEntries() == 0) {
         compact->current_output()->smallest.DecodeFrom(key);
@@ -1010,13 +1004,10 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       compact->current_output()->largest.DecodeFrom(key);
       compact->builder->Add(key, input->value());
 
-      // Close output file if it is big enough
       if (compact->builder->FileSize() >=
           compact->compaction->MaxOutputFileSize()) {
         status = FinishCompactionOutputFile(compact, input);
-        if (!status.ok()) {
-          break;
-        }
+        if (!status.ok()) break;
       }
     }
 
@@ -1055,11 +1046,12 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   if (!status.ok()) {
     RecordBackgroundError(status);
   }
+
   VersionSet::LevelSummaryStorage tmp;
   Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));
+
   return status;
 }
-
 namespace {
 
 struct IterState {
@@ -1126,6 +1118,12 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
                    std::string* value) {
   Status s;
   MutexLock l(&mutex_);
+
+  // Block if a full compaction is in progress
+  while (force_compaction_in_progress_) {
+    background_work_finished_signal_.Wait();
+  }
+
   SequenceNumber snapshot;
   if (options.snapshot != nullptr) {
     snapshot =
@@ -1144,10 +1142,8 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
   bool have_stat_update = false;
   Version::GetStats stats;
 
-  // Unlock while reading from files and memtables
   {
     mutex_.Unlock();
-    // First look in the memtable, then in the immutable memtable (if any).
     LookupKey lkey(key, snapshot);
     if (mem->Get(lkey, value, &s)) {
       // Done
@@ -1168,7 +1164,6 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
   current->Unref();
   return s;
 }
-
 Iterator* DBImpl::NewIterator(const ReadOptions& options) {
   SequenceNumber latest_snapshot;
   uint32_t seed;
@@ -1214,6 +1209,12 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   w.done = false;
 
   MutexLock l(&mutex_);
+
+  // Block if a full compaction is in progress
+  while (force_compaction_in_progress_) {
+    background_work_finished_signal_.Wait();
+  }
+
   writers_.push_back(&w);
   while (!w.done && &w != writers_.front()) {
     w.cv.Wait();
@@ -1222,19 +1223,14 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     return w.status;
   }
 
-  // May temporarily unlock and wait.
   Status status = MakeRoomForWrite(updates == nullptr);
   uint64_t last_sequence = versions_->LastSequence();
   Writer* last_writer = &w;
-  if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
+  if (status.ok() && updates != nullptr) {
     WriteBatch* write_batch = BuildBatchGroup(&last_writer);
     WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
     last_sequence += WriteBatchInternal::Count(write_batch);
 
-    // Add to log and apply to memtable.  We can release the lock
-    // during this phase since &w is currently responsible for logging
-    // and protects against concurrent loggers and concurrent writes
-    // into mem_.
     {
       mutex_.Unlock();
       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
@@ -1250,14 +1246,10 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
       }
       mutex_.Lock();
       if (sync_error) {
-        // The state of the log file is indeterminate: the log record we
-        // just added may or may not show up when the DB is re-opened.
-        // So we force the DB into a mode where all future writes fail.
         RecordBackgroundError(status);
       }
     }
     if (write_batch == tmp_batch_) tmp_batch_->Clear();
-
     versions_->SetLastSequence(last_sequence);
   }
 
@@ -1272,14 +1264,12 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     if (ready == last_writer) break;
   }
 
-  // Notify new head of write queue
   if (!writers_.empty()) {
     writers_.front()->cv.Signal();
   }
 
   return status;
 }
-
 // REQUIRES: Writer list must be non-empty
 // REQUIRES: First writer must have a non-null batch
 WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
@@ -1640,8 +1630,8 @@ Status DestroyDB(const std::string& dbname, const Options& options) {
 }
 bool DBImpl::IsKeyInRangeDeletion(const Slice& user_key) {
   for (const RangeDeletion& rd : range_deletions_) {
-    bool after_start = user_comparator()->Compare(user_key, rd.start_key) >= 0;
-    bool before_end  = user_comparator()->Compare(user_key, rd.end_key)   <  0;
+    bool after_start = (user_comparator()->Compare(user_key, rd.start_key) >= 0);
+    bool before_end  = (user_comparator()->Compare(user_key, rd.end_key)   <  0);
     if (after_start && before_end) return true;
   }
   return false;
@@ -1650,14 +1640,19 @@ bool DBImpl::IsKeyInRangeDeletion(const Slice& user_key) {
 Status DBImpl::DeleteRange(const WriteOptions& options,
                            const Slice& start_key,
                            const Slice& end_key) {
+
+  // Empty or invalid range — nothing to delete
   if (user_comparator()->Compare(start_key, end_key) >= 0) {
     return Status::OK();
   }
 
-  // Phase 1: Write tombstones for all currently visible keys in range
+  // Phase 1: Write individual tombstones for all currently visible keys
+  // in the range. This ensures Get() and Scan() stop seeing them
+  // immediately — no manual compaction needed by the caller.
   {
     Iterator* iter = NewIterator(ReadOptions());
     iter->Seek(start_key);
+
     WriteBatch batch;
     while (iter->Valid()) {
       Slice key = iter->key();
@@ -1665,36 +1660,54 @@ Status DBImpl::DeleteRange(const WriteOptions& options,
       batch.Delete(key);
       iter->Next();
     }
+
     Status iter_status = iter->status();
     delete iter;
+
     if (!iter_status.ok()) return iter_status;
+
     Status s = Write(options, &batch);
     if (!s.ok()) return s;
   }
 
-  // Phase 2: Record range so compaction drops matching SSTable keys
+  // Phase 2: Store the range so DoCompactionWork() can drop matching
+  // SSTable keys when SSTables are merged during compaction.
+  // This handles keys that are in SSTables but not visible via iterator.
   {
     MutexLock l(&mutex_);
     range_deletions_.emplace_back(start_key.ToString(), end_key.ToString());
-  }
-
-  {
-    MutexLock l(&mutex_);
     MaybeScheduleCompaction();
   }
+
   return Status::OK();
 }
-
 Status DBImpl::ForceFullCompaction() {
+
+  // Local stats variables — no CompactionReport parameter needed
+  // Stats are printed at the end per spec requirement
   int     num_compactions    = 0;
   int     total_input_files  = 0;
   int     total_output_files = 0;
   int64_t bytes_read         = 0;
   int64_t bytes_written      = 0;
 
+  // Block all reads and writes during compaction
+  {
+    MutexLock l(&mutex_);
+    force_compaction_in_progress_ = true;
+  }
+
   // Step 1: Flush MemTable to disk
   {
     MutexLock l(&mutex_);
+    while (imm_ != nullptr && bg_error_.ok()) {
+      background_work_finished_signal_.Wait();
+    }
+    if (!bg_error_.ok()) {
+      force_compaction_in_progress_ = false;
+      background_work_finished_signal_.SignalAll();
+      return bg_error_;
+    }
     if (mem_->ApproximateMemoryUsage() > 0) {
       imm_ = mem_;
       has_imm_.store(true, std::memory_order_release);
@@ -1704,45 +1717,87 @@ Status DBImpl::ForceFullCompaction() {
       while (imm_ != nullptr && bg_error_.ok()) {
         background_work_finished_signal_.Wait();
       }
-      if (!bg_error_.ok()) return bg_error_;
+      if (!bg_error_.ok()) {
+        force_compaction_in_progress_ = false;
+        background_work_finished_signal_.SignalAll();
+        return bg_error_;
+      }
     }
   }
 
-  // Step 2: Compact L0 -> Lmax-1 sequentially
+  Status status;
+
+  // Step 2: First forward pass L0 -> Lmax
   for (int level = 0; level < config::kNumLevels - 1; level++) {
     int     files_in  = 0;
-    int64_t br_before = 0, bw_before = 0;
+    int64_t br_before = 0;
+    int64_t bw_before = 0;
     {
       MutexLock l(&mutex_);
       if (versions_->current()->NumFiles(level) == 0) continue;
       files_in  = versions_->current()->NumFiles(level);
       br_before = stats_[level + 1].bytes_read;
       bw_before = stats_[level + 1].bytes_written;
+      total_input_files += files_in;
     }
     TEST_CompactRange(level, nullptr, nullptr);
     {
       MutexLock l(&mutex_);
-      if (!bg_error_.ok()) return bg_error_;
+      if (!bg_error_.ok()) { status = bg_error_; break; }
       int64_t dr = stats_[level + 1].bytes_read    - br_before;
       int64_t dw = stats_[level + 1].bytes_written - bw_before;
       if (dr > 0 || dw > 0) {
         num_compactions++;
-        bytes_read         += dr;
-        bytes_written      += dw;
-        total_input_files  += files_in;
-        total_output_files += versions_->current()->NumFiles(level + 1);
+        bytes_read    += dr;
+        bytes_written += dw;
       }
+      total_output_files += versions_->current()->NumFiles(level + 1);
     }
   }
 
-  // Step 3: Second pass for stragglers
+  if (!status.ok()) {
+    MutexLock l(&mutex_);
+    force_compaction_in_progress_ = false;
+    background_work_finished_signal_.SignalAll();
+    return status;
+  }
+
+  // Step 3: Backward pass — drop tombstones
+  for (int level = config::kNumLevels - 2; level >= 0; level--) {
+    { MutexLock l(&mutex_); if (versions_->current()->NumFiles(level) == 0) continue; }
+    TEST_CompactRange(level, nullptr, nullptr);
+    { MutexLock l(&mutex_); if (!bg_error_.ok()) { status = bg_error_; break; } }
+  }
+
+  if (!status.ok()) {
+    MutexLock l(&mutex_);
+    force_compaction_in_progress_ = false;
+    background_work_finished_signal_.SignalAll();
+    return status;
+  }
+
+  // Step 4: Final forward pass — clean up stragglers
   for (int level = 0; level < config::kNumLevels - 1; level++) {
     { MutexLock l(&mutex_); if (versions_->current()->NumFiles(level) == 0) continue; }
     TEST_CompactRange(level, nullptr, nullptr);
-    { MutexLock l(&mutex_); if (!bg_error_.ok()) return bg_error_; }
+    { MutexLock l(&mutex_); if (!bg_error_.ok()) { status = bg_error_; break; } }
   }
 
-  // Step 4: Print stats
+  // Step 5: Clear range deletions
+  {
+    MutexLock l(&mutex_);
+    range_deletions_.clear();
+  }
+
+  // Step 6: Unblock reads and writes
+  {
+    MutexLock l(&mutex_);
+    force_compaction_in_progress_ = false;
+    background_work_finished_signal_.SignalAll();
+  }
+
+  // Step 7: Print stats — spec requires this on completion
+  // Format bytes helper
   auto fmt = [](int64_t b) -> std::string {
     char buf[64];
     if      (b >= (1LL<<30)) snprintf(buf,sizeof(buf),"%.2f GB",b/double(1LL<<30));
@@ -1752,16 +1807,16 @@ Status DBImpl::ForceFullCompaction() {
     return std::string(buf);
   };
 
-  fprintf(stdout,"\n========================================\n");
-  fprintf(stdout,"   ForceFullCompaction Statistics\n");
-  fprintf(stdout,"========================================\n");
-  fprintf(stdout,"  Compaction rounds   : %d\n", num_compactions);
-  fprintf(stdout,"  Total input files   : %d\n", total_input_files);
-  fprintf(stdout,"  Total output files  : %d\n", total_output_files);
-  fprintf(stdout,"  Total bytes read    : %s\n", fmt(bytes_read).c_str());
-  fprintf(stdout,"  Total bytes written : %s\n", fmt(bytes_written).c_str());
-  fprintf(stdout,"========================================\n\n");
+  printf("\n========================================\n");
+  printf("   ForceFullCompaction Statistics\n");
+  printf("========================================\n");
+  printf("  Compaction rounds executed : %d\n",   num_compactions);
+  printf("  Total input  files         : %d\n",   total_input_files);
+  printf("  Total output files         : %d\n",   total_output_files);
+  printf("  Total bytes read           : %s\n",   fmt(bytes_read).c_str());
+  printf("  Total bytes written        : %s\n",   fmt(bytes_written).c_str());
+  printf("========================================\n\n");
 
-  return Status::OK();
+  return status;
 }
-}  // namespace leveldb
+}

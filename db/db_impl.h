@@ -220,6 +220,7 @@ class DBImpl : public DB {
 
   // Have we encountered a background error in paranoid mode?
   Status bg_error_ GUARDED_BY(mutex_);
+  bool force_compaction_in_progress_ GUARDED_BY(mutex_);
 
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
 };

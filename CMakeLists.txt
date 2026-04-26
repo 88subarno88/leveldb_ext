@@ -524,3 +524,12 @@ target_link_libraries(test_scan leveldb)
 
 add_executable(test_integration2 test_integration2.cc)
 target_link_libraries(test_integration2 leveldb)
+
+add_executable(test_compaction test_compaction.cc)
+target_link_libraries(test_compaction leveldb)
+
+add_executable(test_delete_range test_delete_range.cc)
+target_link_libraries(test_delete_range leveldb)
+
+add_executable(test_integration test_integration.cc)
+target_link_libraries(test_integration leveldb)
