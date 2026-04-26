@@ -219,9 +219,8 @@ struct CompactionReport {
 // Iterates from Level 0 to the deepest level, compacting each in sequence.
 // Foreground reads and writes may be blocked until this completes.
 // Compaction statistics are collected and printed when done.
-virtual Status ForceFullCompaction(CompactionReport* report = nullptr) {
-  return Status::NotSupported("ForceFullCompaction not implemented");
-}
+// In db.h — replace the above with:
+virtual Status ForceFullCompaction(CompactionReport* report = nullptr) = 0;
 };
 
 

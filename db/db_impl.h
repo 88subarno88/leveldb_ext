@@ -114,9 +114,9 @@ class DBImpl : public DB {
     int64_t bytes_written;
   };
 
-  void CollectCompactionStats(int level,
-                              const CompactionStats& before,
-                              CompactionReport* report);
+  // void CollectCompactionStats(int level,
+  //                             const CompactionStats& before,
+  //                             CompactionReport* report);
 
 
   Iterator* NewInternalIterator(const ReadOptions&,

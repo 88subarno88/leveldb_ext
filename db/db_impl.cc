@@ -51,6 +51,7 @@ struct DBImpl::Writer {
   port::CondVar cv;
 };
 
+// DELETE this entire block from db_impl.cc:
 struct CompactionStats {
   CompactionStats() : micros(0), bytes_read(0), bytes_written(0) {}
   
@@ -236,8 +237,9 @@ Status DBImpl::ForceFullCompaction(CompactionReport* report) {
     }  
     if (!status.ok()) break;
   }
-
-  //print report
+if (report != nullptr && status.ok()) {
+    report->Print();
+  }
 
   return status;
 }
@@ -1754,25 +1756,25 @@ void DBImpl::GetApproximateSizes(const Range* range, int n, uint64_t* sizes) {
   v->Unref();
 }
 
-void DBImpl::CollectCompactionStats(int level,
-                                    const CompactionStats& before,
-                                    CompactionReport* report) {
-  if (report == nullptr) return;
+// void DBImpl::CollectCompactionStats(int level,
+//                                     const CompactionStats& before,
+//                                     CompactionReport* report) {
+//   if (report == nullptr) return;
 
-  // stats_[level] is updated by DoCompactionWork() after each compaction.
-  // The delta between current and 'before' gives us this round's numbers.
-  const CompactionStats& after = stats_[level];
+//   // stats_[level] is updated by DoCompactionWork() after each compaction.
+//   // The delta between current and 'before' gives us this round's numbers.
+//   const CompactionStats& after = stats_[level];
 
-  int64_t delta_bytes_read    = after.bytes_read    - before.bytes_read;
-  int64_t delta_bytes_written = after.bytes_written - before.bytes_written;
+//   int64_t delta_bytes_read    = after.bytes_read    - before.bytes_read;
+//   int64_t delta_bytes_written = after.bytes_written - before.bytes_written;
 
-  // Only count this as a real compaction if actual work was done
-  if (delta_bytes_read > 0 || delta_bytes_written > 0) {
-    report->num_compactions++;
-    report->bytes_read    += delta_bytes_read;
-    report->bytes_written += delta_bytes_written;
-  }
-}
+//   // Only count this as a real compaction if actual work was done
+//   if (delta_bytes_read > 0 || delta_bytes_written > 0) {
+//     report->num_compactions++;
+//     report->bytes_read    += delta_bytes_read;
+//     report->bytes_written += delta_bytes_written;
+//   }
+// }
 
 // Default implementations of convenience methods that subclasses of DB
 // can call if they wish
