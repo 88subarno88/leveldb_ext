@@ -87,11 +87,12 @@ class DBImpl : public DB {
 
   // Stores active range deletions, checked during compaction
   struct RangeDeletion {
-    std::string start_key;
-    std::string end_key;
-    RangeDeletion(const std::string& s, const std::string& e)
-        : start_key(s), end_key(e) {}
-  };
+  std::string start_key;
+  std::string end_key;
+  SequenceNumber sequence_number;
+  RangeDeletion(std::string s, std::string e, SequenceNumber seq)
+      : start_key(std::move(s)), end_key(std::move(e)), sequence_number(seq) {}
+};
   bool IsKeyInRangeDeletion(const Slice& user_key);
   std::vector<RangeDeletion> range_deletions_ ;
   

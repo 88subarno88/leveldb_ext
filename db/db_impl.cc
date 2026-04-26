@@ -982,7 +982,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       // Only drop kTypeValue entries — tombstones are handled above.
      if (!drop && ikey.type == kTypeValue) {
       for (const RangeDeletion& rd : local_range_deletions) {
-        if (user_comparator()->Compare(ikey.user_key, rd.start_key) >= 0 &&
+        if (ikey.sequence <= rd.sequence_number &&
+            user_comparator()->Compare(ikey.user_key, rd.start_key) >= 0 &&
             user_comparator()->Compare(ikey.user_key, rd.end_key)   <  0) {
           drop = true;
           break;
@@ -1675,7 +1676,8 @@ Status DBImpl::DeleteRange(const WriteOptions& options,
   // This handles keys that are in SSTables but not visible via iterator.
   {
     MutexLock l(&mutex_);
-    range_deletions_.emplace_back(start_key.ToString(), end_key.ToString());
+    SequenceNumber seq = versions_->LastSequence();
+    range_deletions_.emplace_back(start_key.ToString(), end_key.ToString(), seq);
     MaybeScheduleCompaction();
   }
 

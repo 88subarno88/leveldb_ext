@@ -1,550 +1,510 @@
-#include <iostream>
-#include <string>
-#include <vector>
-#include <utility>
-#include <cassert>
-#include <cstdio>
-#include <cstring>
+// COP290 A3 self-check: exercises Scan, DeleteRange, and ForceFullCompaction
+// with a deterministic prefix (assignment + clarifications) and a seeded random
+// workload. Aligns with assignment 3.4: fresh DB (rm -rf) before Open.
+
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+#include <cstdint>
+#include <random>
 
 #include "leveldb/db.h"
-#include "leveldb/options.h"
-#include "leveldb/status.h"
-#include "leveldb/write_batch.h"
+#include "leveldb/iterator.h"
 
-// -------------------------------------------------------
-// Shared Helpers
-// -------------------------------------------------------
+namespace {
 
-static leveldb::DB* OpenFreshDB(const std::string& path,
-                                 size_t write_buffer = 0) {
-  system(("rm -rf " + path).c_str());
-  leveldb::Options opts;
-  opts.create_if_missing = true;
-  if (write_buffer > 0) opts.write_buffer_size = write_buffer;
-  leveldb::DB* db;
-  leveldb::Status s = leveldb::DB::Open(opts, path, &db);
-  if (!s.ok()) {
-    std::cerr << "OpenFreshDB failed: " << s.ToString() << "\n";
-    exit(1);
+// Inclusive [lo, hi] from one std::mt19937 draw. std::uniform_int_distribution
+// is not required to map engine output the same way on every stdlib, so
+// bit-identical goldens (ans.txt) would otherwise differ across machines.
+int UniformInRange(std::mt19937& gen, int lo, int hi) {
+  if (lo > hi) {
+    return lo;
   }
-  return db;
-}
-
-static void Put(leveldb::DB* db,
-                const std::string& k,
-                const std::string& v) {
-  db->Put(leveldb::WriteOptions(), k, v);
-}
-
-static void Del(leveldb::DB* db, const std::string& k) {
-  db->Delete(leveldb::WriteOptions(), k);
-}
-
-static std::string Get(leveldb::DB* db, const std::string& k) {
-  std::string val;
-  leveldb::Status s = db->Get(leveldb::ReadOptions(), k, &val);
-  return s.ok() ? val : "";
-}
-
-static bool Exists(leveldb::DB* db, const std::string& k) {
-  std::string val;
-  return db->Get(leveldb::ReadOptions(), k, &val).ok();
-}
-
-// Scan wrapper — returns pairs
-static std::vector<std::pair<std::string,std::string>>
-Scan(leveldb::DB* db,
-     const std::string& start,
-     const std::string& end) {
-  std::vector<std::pair<std::string,std::string>> result;
-  leveldb::Status s = db->Scan(leveldb::ReadOptions(), start, end, &result);
-  if (!s.ok()) {
-    std::cerr << "Scan failed: " << s.ToString() << "\n";
+  const int64_t span64 =
+      static_cast<int64_t>(hi) - static_cast<int64_t>(lo) + 1;
+  if (span64 <= 0) {
+    return lo;
   }
-  return result;
+  const uint32_t span = static_cast<uint32_t>(span64);
+  const uint32_t x = gen();
+  return lo + static_cast<int>(x % span);
 }
 
-// Scan everything
-static std::vector<std::pair<std::string,std::string>>
-ScanAll(leveldb::DB* db) {
-  return Scan(db, "", std::string(8, '\xff'));
+const char* DbPath() {
+  const char* p = std::getenv("COP290_DB");
+  return (p && p[0]) ? p : "/tmp/testdb";
 }
 
-// Insert N keys with zero-padded numeric suffix
-static void InsertRange(leveldb::DB* db,
-                         int from, int to,
-                         const std::string& prefix = "k",
-                         const std::string& val_prefix = "v") {
-  for (int i = from; i < to; i++) {
-    char k[32], v[32];
-    snprintf(k, sizeof(k), "%s%06d", prefix.c_str(), i);
-    snprintf(v, sizeof(v), "%s%06d", val_prefix.c_str(), i);
-    Put(db, k, v);
+int Fail(const char* what, const leveldb::Status& s) {
+  std::cerr << "FAIL: " << what << ": " << s.ToString() << std::endl;
+  return 1;
+}
+
+int Fail(const char* what) {
+  std::cerr << "FAIL: " << what << std::endl;
+  return 1;
+}
+
+// Expected [start_key, end_key) per LevelDB bytewise order — matches Iterator /
+// Get semantics for string keys in this harness.
+void ModelDeleteRangeInPlace(std::map<std::string, std::string>* m,
+                            const std::string& start_key,
+                            const std::string& end_key,
+                            std::vector<std::string>* removed_out) {
+  if (removed_out) {
+    removed_out->clear();
+  }
+  if (start_key >= end_key) {
+    return;
+  }
+  for (auto it = m->lower_bound(start_key);
+       it != m->end() && it->first < end_key;) {
+    if (removed_out) {
+      removed_out->push_back(it->first);
+    }
+    it = m->erase(it);
   }
 }
 
-static std::string Key(int i, const std::string& prefix = "k") {
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%s%06d", prefix.c_str(), i);
-  return std::string(buf);
-}
-
-// Print test result
-static void Pass(const std::string& name) {
-  std::cout << "  [PASS] " << name << "\n";
-}
-
-// -------------------------------------------------------
-// INTEGRATION TEST 1:
-// Scan → DeleteRange → Scan
-// Verify scan results reflect deletions
-// -------------------------------------------------------
-void Test_Scan_Then_DeleteRange_Then_Scan() {
-  std::cout << "\n=== INTEGRATION 1: Scan → DeleteRange → Scan ===\n";
-
-  leveldb::DB* db = OpenFreshDB("/tmp/itest_1");
-  InsertRange(db, 0, 100);  // k000000 .. k000099
-
-  // Scan before delete
-  auto before = Scan(db, Key(0), Key(100));
-  assert(before.size() == 100);
-  Pass("Initial scan returns 100 keys");
-
-  // Delete middle 50 keys
-  leveldb::Status s = db->DeleteRange(
-      leveldb::WriteOptions(), Key(25), Key(75));
-  assert(s.ok());
-
-  // Scan after delete
-  auto after = ScanAll(db);
-  assert(after.size() == 50);
-  assert(after.front().first == Key(0));
-  assert(after.back().first  == Key(99));
-  Pass("After DeleteRange [25,75), 50 keys remain");
-
-  // Verify boundaries exactly
-  assert(!Exists(db, Key(25)));   // start_key is deleted
-  assert(!Exists(db, Key(74)));   // last deleted key
-  assert(Exists(db, Key(24)));    // just before range → survives
-  assert(Exists(db, Key(75)));    // end_key (exclusive) → survives
-  Pass("Boundary keys correct");
-
-  delete db;
-  std::cout << "PASSED\n";
-}
-
-// -------------------------------------------------------
-// INTEGRATION TEST 2:
-// DeleteRange → Put (inside deleted range) → Scan
-// New puts inside a deleted range must be visible
-// -------------------------------------------------------
-void Test_DeleteRange_Then_Put_Inside_Range() {
-  std::cout << "\n=== INTEGRATION 2: DeleteRange → Put inside range → Scan ===\n";
-
-  leveldb::DB* db = OpenFreshDB("/tmp/itest_2");
-  InsertRange(db, 0, 50);
-
-  // Delete everything
-  db->DeleteRange(leveldb::WriteOptions(), Key(0), Key(50));
-
-  // Re-insert a few keys inside the deleted range
-  Put(db, Key(10), "new_value_10");
-  Put(db, Key(20), "new_value_20");
-  Put(db, Key(30), "new_value_30");
-
-  auto results = ScanAll(db);
-  assert(results.size() == 3);
-  assert(results[0].first  == Key(10));
-  assert(results[0].second == "new_value_10");
-  assert(results[1].first  == Key(20));
-  assert(results[1].second == "new_value_20");
-  assert(results[2].first  == Key(30));
-  assert(results[2].second == "new_value_30");
-  Pass("3 re-inserted keys visible after range deletion");
-
-  // Original deleted keys must still be gone
-  assert(!Exists(db, Key(0)));
-  assert(!Exists(db, Key(5)));
-  assert(!Exists(db, Key(49)));
-  Pass("Original deleted keys still absent");
-
-  delete db;
-  std::cout << "PASSED\n";
-}
-
-// -------------------------------------------------------
-// INTEGRATION TEST 3:
-// Scan → ForceFullCompaction → Scan
-// Compaction must not change what Scan returns
-// -------------------------------------------------------
-void Test_Scan_Survives_Compaction() {
-  std::cout << "\n=== INTEGRATION 3: Scan before and after ForceFullCompaction ===\n";
-
-  leveldb::DB* db = OpenFreshDB("/tmp/itest_3", 64 * 1024);
-  InsertRange(db, 0, 2000);
-
-  // Scan before compaction
-  auto before = ScanAll(db);
-  assert(before.size() == 2000);
-  Pass("Scan before compaction: 2000 keys");
-
-  // Compact
-  
-  leveldb::Status s = db->ForceFullCompaction();
-  assert(s.ok());
-
-  // Scan after compaction
-  auto after = ScanAll(db);
-  assert(after.size() == 2000);
-  Pass("Scan after compaction: still 2000 keys");
-
-  // Verify contents are identical
-  assert(before == after);
-  Pass("Scan results identical before and after compaction");
-
-  
-  delete db;
-  std::cout << "PASSED\n";
-}
-
-// -------------------------------------------------------
-// INTEGRATION TEST 4:
-// DeleteRange → ForceFullCompaction → Scan
-// Compaction must physically remove range-deleted keys
-// -------------------------------------------------------
-void Test_DeleteRange_Compaction_Scan() {
-  std::cout << "\n=== INTEGRATION 4: DeleteRange → Compaction → Scan ===\n";
-
-  leveldb::DB* db = OpenFreshDB("/tmp/itest_4", 64 * 1024);
-  InsertRange(db, 0, 3000);
-
-  // First compact to push data to lower levels
-  db->CompactRange(nullptr, nullptr);
-
-  // Delete a range that spans SSTable files
-  db->DeleteRange(leveldb::WriteOptions(), Key(1000), Key(2000));
-
-  // Force full compaction to enforce deletion
-  
-  leveldb::Status s = db->ForceFullCompaction();
-  assert(s.ok());
-
-  // Scan: should see only 2000 keys
-  auto results = ScanAll(db);
-  assert(results.size() == 2000);
-  Pass("2000 keys remain after range deletion + compaction");
-
-  // Spot checks
-  assert(Exists(db, Key(0)));
-  assert(Exists(db, Key(999)));
-  assert(!Exists(db, Key(1000)));
-  assert(!Exists(db, Key(1500)));
-  assert(!Exists(db, Key(1999)));
-  assert(Exists(db, Key(2000)));
-  assert(Exists(db, Key(2999)));
-  Pass("All boundary checks correct");
-
-  
-  delete db;
-  std::cout << "PASSED\n";
-}
-
-// -------------------------------------------------------
-// INTEGRATION TEST 5:
-// Put → Scan → Delete individual → Scan → DeleteRange → Scan
-// → ForceFullCompaction → Scan
-// Full workflow: all APIs together
-// -------------------------------------------------------
-void Test_Full_Workflow() {
-  std::cout << "\n=== INTEGRATION 5: Full Workflow (all APIs) ===\n";
-
-  leveldb::DB* db = OpenFreshDB("/tmp/itest_5", 64 * 1024);
-
-  // Phase 1: Insert
-  InsertRange(db, 0, 500);
-  assert(ScanAll(db).size() == 500);
-  Pass("Phase 1: 500 keys inserted");
-
-  // Phase 2: Individual deletes
-  for (int i = 0; i < 500; i += 10) Del(db, Key(i));
-  assert(ScanAll(db).size() == 450);  // 50 keys deleted
-  Pass("Phase 2: 50 individual deletes → 450 keys");
-
-  // Phase 3: Overwrites
-  for (int i = 1; i < 500; i += 10)
-    Put(db, Key(i), "overwritten");
-  auto r3 = Scan(db, Key(1), Key(2));
-  assert(!r3.empty() && r3[0].second == "overwritten");
-  Pass("Phase 3: overwritten values visible in Scan");
-
-  // Phase 4: Range delete
-  db->DeleteRange(leveldb::WriteOptions(), Key(200), Key(300));
-  auto r4 = ScanAll(db);
-  assert(!Exists(db, Key(201)));
-  assert(Exists(db, Key(199)));
-  assert(Exists(db, Key(300)));
-  Pass("Phase 4: DeleteRange [200,300) applied");
-
-  // Phase 5: ForceFullCompaction
-  
-  db->ForceFullCompaction();
-  auto r5 = ScanAll(db);
-  assert(r5 == r4);  // compaction must not change visible data
-  Pass("Phase 5: ForceFullCompaction preserves data");
-
-  // Phase 6: Scan after compaction with range
-  auto r6 = Scan(db, Key(100), Key(150));
-  for (auto& kv : r6) {
-    assert(kv.first >= Key(100) && kv.first < Key(150));
+std::vector<std::pair<std::string, std::string>> ModelRangeScan(
+    const std::map<std::string, std::string>& m,
+    const std::string& start_key,
+    const std::string& end_key) {
+  std::vector<std::pair<std::string, std::string>> r;
+  if (start_key >= end_key) {
+    return r;
   }
-  Pass("Phase 6: Scan on sub-range correct after compaction");
-
-  
-  delete db;
-  std::cout << "PASSED\n";
-}
-
-// -------------------------------------------------------
-// INTEGRATION TEST 6:
-// Interleaved Puts and DeleteRanges — stress ordering
-// -------------------------------------------------------
-void Test_Interleaved_Puts_And_DeleteRanges() {
-  std::cout << "\n=== INTEGRATION 6: Interleaved Puts and DeleteRanges ===\n";
-
-  leveldb::DB* db = OpenFreshDB("/tmp/itest_6");
-
-  // Round 1: insert 0..99
-  InsertRange(db, 0, 100);
-
-  // Round 2: delete 0..49
-  db->DeleteRange(leveldb::WriteOptions(), Key(0), Key(50));
-
-  // Round 3: insert 0..24 again (partially overlaps deleted range)
-  InsertRange(db, 0, 25, "k", "new_v");
-
-  // Round 4: delete 75..99
-  db->DeleteRange(leveldb::WriteOptions(), Key(75), Key(100));
-
-  // Round 5: insert 80..84 again
-  InsertRange(db, 80, 85, "k", "newest_v");
-
-  auto results = ScanAll(db);
-
-  // Expected: k000000..k000024 (new_v), k000050..k000074, k000080..k000084 (newest_v)
-  // = 25 + 25 + 5 = 55 keys
-  std::cout << "  Remaining keys: " << results.size() << "\n";
-  assert(results.size() == 55);
-  Pass("Correct count after interleaved puts/deletes");
-
-  // Check values of re-inserted keys
-  assert(Get(db, Key(0))  == "new_v000000");
-  assert(Get(db, Key(24)) == "new_v000024");
-  Pass("Re-inserted keys have new values");
-
-  // Check deleted ranges are gone
-  assert(!Exists(db, Key(25)));   // was deleted in round 2, not re-inserted
-  assert(!Exists(db, Key(49)));
-  assert(!Exists(db, Key(75)));
-  assert(!Exists(db, Key(99)));
-  Pass("Deleted keys absent");
-
-  // Check re-inserted in round 5
-  assert(Get(db, Key(80)) == "newest_v000080");
-  assert(Get(db, Key(84)) == "newest_v000084");
-  assert(!Exists(db, Key(85)));   // not re-inserted in round 5
-  Pass("Round 5 re-inserts correct");
-
-  delete db;
-  std::cout << "PASSED\n";
-}
-
-// -------------------------------------------------------
-// INTEGRATION TEST 7:
-// Multiple DeleteRanges → ForceFullCompaction → Scan
-// -------------------------------------------------------
-void Test_Multiple_DeleteRanges_Then_Compaction() {
-  std::cout << "\n=== INTEGRATION 7: Multiple DeleteRanges → Compaction → Scan ===\n";
-
-  leveldb::DB* db = OpenFreshDB("/tmp/itest_7", 64 * 1024);
-  InsertRange(db, 0, 10000);
-
-  // Apply 5 non-overlapping range deletions
-  db->DeleteRange(leveldb::WriteOptions(), Key(0),    Key(1000));
-  db->DeleteRange(leveldb::WriteOptions(), Key(2000), Key(3000));
-  db->DeleteRange(leveldb::WriteOptions(), Key(4000), Key(5000));
-  db->DeleteRange(leveldb::WriteOptions(), Key(6000), Key(7000));
-  db->DeleteRange(leveldb::WriteOptions(), Key(8000), Key(9000));
-
-  // Each deletes 1000 keys → 5000 deleted, 5000 remain
-  
-  db->ForceFullCompaction();
-
-  auto results = ScanAll(db);
-  std::cout << "  Remaining: " << results.size() << " (expected 5000)\n";
-  assert(results.size() == 5000);
-  Pass("5000 keys remain after 5 range deletions");
-
-  // Verify each surviving band
-  assert(Exists(db, Key(1000)));
-  assert(Exists(db, Key(1999)));
-  assert(!Exists(db, Key(2000)));
-  assert(!Exists(db, Key(2999)));
-  assert(Exists(db, Key(3000)));
-  Pass("All band boundaries correct");
-
-  
-  delete db;
-  std::cout << "PASSED\n";
-}
-
-// -------------------------------------------------------
-// INTEGRATION TEST 8:
-// Scan across MemTable + SSTable boundary
-// Data in MemTable and L0/L1 must both appear in scan
-// -------------------------------------------------------
-void Test_Scan_Across_Memory_And_Disk() {
-  std::cout << "\n=== INTEGRATION 8: Scan Across MemTable and SSTables ===\n";
-
-  leveldb::DB* db = OpenFreshDB("/tmp/itest_8", 64 * 1024);
-
-  // Batch 1: write keys 0..999 and flush to disk
-  InsertRange(db, 0, 1000);
-  db->CompactRange(nullptr, nullptr);  // flush to SSTables
-  Pass("Batch 1 flushed to SSTables");
-
-  // Batch 2: write keys 1000..1999 (stay in MemTable initially)
-  InsertRange(db, 1000, 2000);
-  Pass("Batch 2 in MemTable");
-
-  // Scan the full range — must see both batches
-  auto results = ScanAll(db);
-  assert(results.size() == 2000);
-  Pass("Scan sees all 2000 keys across MemTable and SSTables");
-
-  // Verify ordering is correct (keys should be sorted)
-  for (size_t i = 1; i < results.size(); i++) {
-    assert(results[i].first > results[i-1].first);
+  for (auto it = m.lower_bound(start_key);
+       it != m.end() && it->first < end_key; ++it) {
+    r.push_back({it->first, it->second});
   }
-  Pass("Scan results are in sorted order");
-
-  // Verify a specific cross-boundary scan
-  auto sub = Scan(db, Key(900), Key(1100));
-  assert(sub.size() == 200);
-  assert(sub.front().first == Key(900));
-  assert(sub.back().first  == Key(1099));
-  Pass("Cross-boundary sub-scan [900,1100) correct");
-
-  delete db;
-  std::cout << "PASSED\n";
+  return r;
 }
 
-// -------------------------------------------------------
-// INTEGRATION TEST 9:
-// ForceFullCompaction stats must be consistent
-// bytes_written <= bytes_read (compaction removes old data)
-// num_compactions matches level activity
-// -------------------------------------------------------
-void Test_Compaction_Stats_Consistency() {
-  std::cout << "\n=== INTEGRATION 9: Compaction Stats Consistency ===\n";
+bool IsStrictlySorted(const std::vector<std::pair<std::string, std::string>>& a) {
+  for (size_t i = 1; i < a.size(); ++i) {
+    if (a[i - 1].first >= a[i].first) {
+      return false;
+    }
+  }
+  return true;
+}
 
-  leveldb::DB* db = OpenFreshDB("/tmp/itest_9", 64 * 1024);
+// Deterministic checks matching clarifications: snapshot semantics, inverted
+// range (empty), empty DeleteRange. Lexicographic order: "snap_a" < "snap_b" <
+// "snap_c" for the snapshot exercise.
+int RunDeterministic(leveldb::DB* db, std::ofstream& out) {
+  leveldb::WriteOptions wopt;
+  leveldb::ReadOptions ropt;
 
-  // Write data with many overwrites to create lots of dead versions
-  for (int round = 0; round < 10; round++) {
-    InsertRange(db, 0, 500);
+  const std::string k = "det_inv_z";
+  const std::string l = "det_inv_a";
+  {
+    // start_key > end_key => empty result (Piazza: treat as empty range, not
+    // error)
+    if (k <= l) {
+      std::cerr << "Internal checker error: inverted test keys not ordered\n";
+      return 1;
+    }
+    std::vector<std::pair<std::string, std::string>> r;
+    leveldb::Status s = db->Scan(ropt, k, l, &r);
+    if (!s.ok()) {
+      return Fail("Scan (inverted range)", s);
+    }
+    if (!r.empty()) {
+      std::cerr << "FAIL: Scan inverted range expected 0 results\n";
+      return 1;
+    }
+    out << "DET scan_inverted 0\n";
   }
 
-  
-  db->ForceFullCompaction();
-
-  
-
-  // Sanity checks on stats
-  Pass("Stats checks passed");
-
-  // All 500 keys must be readable with correct (latest) value
-  for (int i = 0; i < 500; i++) {
-    assert(Exists(db, Key(i)));
+  {
+    leveldb::Status s = db->Put(wopt, "snap_a", "1");
+    if (!s.ok()) {
+      return Fail("Put snap_a", s);
+    }
+    s = db->Put(wopt, "snap_c", "3");
+    if (!s.ok()) {
+      return Fail("Put snap_c", s);
+    }
+    const leveldb::Snapshot* snap = db->GetSnapshot();
+    s = db->Put(wopt, "snap_b", "2");
+    if (!s.ok()) {
+      return Fail("Put snap_b", s);
+    }
+    leveldb::ReadOptions sro;
+    sro.snapshot = snap;
+    std::vector<std::pair<std::string, std::string>> r;
+    s = db->Scan(sro, "snap_a", "snap_c", &r);
+    db->ReleaseSnapshot(snap);
+    if (!s.ok()) {
+      return Fail("Scan (snapshot range)", s);
+    }
+    // [snap_a, snap_c) visible at snapshot: a and c existed; b does not; end
+    // is exclusive for c, so c is not returned.
+    if (r.size() != 1 || r[0].first != "snap_a" || r[0].second != "1") {
+      std::cerr
+          << "FAIL: snapshot scan expected one pair (snap_a,1), got count="
+          << r.size() << std::endl;
+      return 1;
+    }
+    out << "DET scan_snapshot 1\n";
   }
-  Pass("All 500 keys readable with correct values");
 
-  delete db;
-  std::cout << "PASSED\n";
+  {
+    leveldb::Status s = db->DeleteRange(wopt, "det_same", "det_same");
+    if (!s.ok()) {
+      return Fail("DeleteRange empty", s);
+    }
+    out << "DET delrange_empty ok\n";
+  }
+  return 0;
 }
 
-// -------------------------------------------------------
-// INTEGRATION TEST 10:
-// Concurrent-style test: interleave all 3 APIs rapidly
-// -------------------------------------------------------
-void Test_Rapid_Interleaving() {
-  std::cout << "\n=== INTEGRATION 10: Rapid Interleaving of All APIs ===\n";
+const char* RaceDbPath() {
+  const char* p = std::getenv("COP290_RACE_DB");
+  return (p && p[0]) ? p : "/tmp/testdb_race";
+}
 
-  leveldb::DB* db = OpenFreshDB("/tmp/itest_10", 64 * 1024);
+// Multi-threaded stress: concurrent Put / Get / Delete / Scan / DeleteRange /
+// ForceFullCompaction on one DB, per clarifications (integrate with LevelDB
+// thread safety, no golden output — pass/fail only). Uses a separate path from
+// the single-threaded trace so `out.txt` is unchanged for `make run`.
+// If `emit_race_line` is false, success is silent (main prints `ST: OK` /
+// `RACE: OK` for `sample --concurrent` / `make test`).
+int RunConcurrentRaceTest(bool emit_race_line) {
+  {
+    const std::string rmcmd =
+        std::string("rm -rf '") + std::string(RaceDbPath()) + "'";
+    std::system(rmcmd.c_str());
+  }
+  leveldb::DB* db = nullptr;
+  leveldb::Options options;
+  options.create_if_missing = true;
+  leveldb::Status ostatus = leveldb::DB::Open(options, RaceDbPath(), &db);
+  if (!ostatus.ok()) {
+    std::cerr << "RACE: open: " << ostatus.ToString() << std::endl;
+    return 1;
+  }
 
-  // Simulate a real workload: rapid puts, scans, deletes, compactions
-  for (int batch = 0; batch < 5; batch++) {
-    int base = batch * 200;
+  // Tunable via env: COP290_RACE_THREADS (default 6), COP290_RACE_OPS (default
+  // 2500 per thread).
+  int n_threads = 6;
+  int ops_each = 2500;
+  if (const char* t = std::getenv("COP290_RACE_THREADS")) {
+    n_threads = std::max(2, std::atoi(t));
+  }
+  if (const char* o = std::getenv("COP290_RACE_OPS")) {
+    ops_each = std::max(200, std::atoi(o));
+  }
 
-    // Insert 200 keys
-    InsertRange(db, base, base + 200);
+  std::vector<std::thread> threads;
+  std::atomic<bool> failed{false};
 
-    // Scan to verify
-    auto r = Scan(db, Key(base), Key(base + 200));
-    assert((int)r.size() == 200);
+  for (int tid = 0; tid < n_threads; ++tid) {
+    threads.emplace_back([db, n_threads, ops_each, tid, &failed]() {
+      std::mt19937 gen(67u + 1009u * static_cast<unsigned>(tid) +
+                       17u * static_cast<unsigned>(n_threads));
+      const std::string pfx = "m" + std::to_string(tid);
+      for (int i = 0; i < ops_each; ++i) {
+        if (failed.load()) {
+          return;
+        }
+        // Occasional cross-thread key to stress DeleteRange vs Put.
+        int foreign = (tid + 1 + (i & 3)) % n_threads;
+        std::string k1 =
+            pfx + "k" + std::to_string(UniformInRange(gen, 0, 9999));
+        std::string k2 = "m" + std::to_string(foreign) + "k" +
+                         std::to_string(UniformInRange(gen, 0, 9999) ^ 1);
+        std::string a = k1, b = k2;
+        if (a > b) {
+          std::swap(a, b);
+        }
+        std::string value_buf =
+            pfx + "v" + std::to_string(UniformInRange(gen, 1, 100000));
+        int op = UniformInRange(gen, 0, 99);
+        leveldb::WriteOptions wo;
+        leveldb::ReadOptions ro;
+        leveldb::Status s;
+        if (op < 46) {
+          s = db->Put(wo, k1, value_buf);
+        } else if (op < 66) {
+          std::string g;
+          s = db->Get(ro, k1, &g);
+        } else if (op < 80) {
+          s = db->Delete(wo, k1);
+        } else if (op < 89) {
+          std::vector<std::pair<std::string, std::string>> r;
+          s = db->Scan(ro, a, b, &r);
+        } else if (op < 96) {
+          s = db->DeleteRange(wo, a, b);
+        } else if (op < 99) {
+          s = db->Get(ro, k1, &value_buf);
+        } else {
+          s = db->ForceFullCompaction();
+        }
+        if (!s.ok() && !s.IsNotFound()) {
+          failed.store(true);
+          return;
+        }
+      }
+    });
+  }
 
-    // Delete half
-    db->DeleteRange(leveldb::WriteOptions(), Key(base + 50), Key(base + 150));
+  for (auto& t : threads) {
+    t.join();
+  }
 
-    // Verify 100 remain in this batch
-    auto r2 = Scan(db, Key(base), Key(base + 200));
-    assert((int)r2.size() == 100);
+  if (failed.load()) {
+    std::cerr << "RACE: a worker reported a non-OK non-NotFound status\n";
+    delete db;
+    return 1;
+  }
 
-    // Compact every other batch
-    if (batch % 2 == 0) {
-      
-      db->ForceFullCompaction();
+  leveldb::Status f = db->ForceFullCompaction();
+  if (!f.ok()) {
+    std::cerr << "RACE: final ForceFullCompaction: " << f.ToString()
+              << std::endl;
+    delete db;
+    return 1;
+  }
 
-      // Scan still returns same 100 after compaction
-      auto r3 = Scan(db, Key(base), Key(base + 200));
-      assert((int)r3.size() == 100);
+  delete db;
+  if (emit_race_line) {
+    std::cout << "RACE: ok threads=" << n_threads
+              << " ops_per_thread=" << ops_each << std::endl;
+  }
+  return 0;
+}
+
+}  // namespace
+
+namespace {
+bool ArgMatch(int argc, char** argv, const char* flag) {
+  for (int i = 1; i < argc; ++i) {
+    if (std::string_view(argv[i]) == flag) {
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (ArgMatch(argc, argv, "--race-only")) {
+    std::cout << "ST: skip" << std::endl;
+    return RunConcurrentRaceTest(true);
+  }
+  if (ArgMatch(argc, argv, "--help") || ArgMatch(argc, argv, "-h")) {
+    std::cout
+        << "usage: sample [--write] [--concurrent] [--race-only] [--help]\n"
+        << "  (default)     single-threaded workload -> out.txt\n"
+        << "  --write       write ans.txt (for update_golden)\n"
+        << "  --concurrent  after ST run, also run multi-threaded RACE on "
+           "COP290_RACE_DB (default /tmp/testdb_race)\n"
+        << "  --race-only   only the concurrent stress (no out.txt; for "
+           "make race)\n";
+    return 0;
+  }
+
+  const bool do_concurrent = ArgMatch(argc, argv, "--concurrent");
+  bool write_mode = false;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string_view(argv[i]) == "--write") {
+      write_mode = true;
     }
   }
 
-  Pass("All 5 batch rounds correct");
+  const std::string output_path = write_mode ? "ans.txt" : "out.txt";
+  std::ofstream out(output_path, std::ios::out | std::ios::trunc);
+  if (!out.is_open()) {
+    std::cerr << "Failed to open output file: " << output_path << std::endl;
+    return 1;
+  }
 
-  // Final count: 5 batches × 100 surviving keys = 500
-  auto final_results = ScanAll(db);
-  std::cout << "  Final key count: " << final_results.size()
-            << " (expected 500)\n";
-  assert(final_results.size() == 500);
-  Pass("Final total count correct");
+  const char* const dbname = DbPath();
+  {
+    const std::string rmcmd = std::string("rm -rf '") + dbname + "'";
+    std::system(rmcmd.c_str());
+  }
+
+  leveldb::DB* db = nullptr;
+  leveldb::Options options;
+  options.create_if_missing = true;
+  leveldb::Status status = leveldb::DB::Open(options, dbname, &db);
+  if (!status.ok()) {
+    std::cerr << "Failed to open database: " << status.ToString() << std::endl;
+    return 1;
+  }
+  if (!db) {
+    return 1;
+  }
+
+  leveldb::WriteOptions write_options;
+  leveldb::ReadOptions read_options;
+
+  constexpr unsigned kSeed = 67;
+  constexpr int kNumOps = 10000;
+  // protocol=4: portable UniformInRange (one mt19937 draw, uint32_t %);
+  // protocol=3 used std::uniform_int_distribution (not cross-stdlib stable).
+  out << "protocol=4 seed=" << kSeed << " ops=" << kNumOps << "\n";
+
+  int drc = RunDeterministic(db, out);
+  if (drc != 0) {
+    delete db;
+    return drc;
+  }
+
+  std::map<std::string, std::string> model; 
+  std::mt19937 gen(kSeed);
+
+  for (int i = 0; i < kNumOps; ++i) {
+    int op = UniformInRange(gen, 0, 99);
+    std::string k1 = "key" + std::to_string(UniformInRange(gen, 1, 10000));
+    std::string k2 = "key" + std::to_string(UniformInRange(gen, 1, 10000));
+    std::string v = "value" + std::to_string(UniformInRange(gen, 1, 100000));
+
+    if (op < 50) {
+      const leveldb::Status ps = db->Put(write_options, k1, v);
+      if (!ps.ok()) {
+        return Fail("Put (random op)", ps);
+      }
+      std::string got;
+      const leveldb::Status gr = db->Get(read_options, k1, &got);
+      if (!gr.ok()) {
+        return Fail("Get after Put (read-your-writes)", gr);
+      }
+      if (got != v) {
+        return Fail("Get after Put: value mismatch");
+      }
+      model[k1] = v;
+    } else if (op < 70) {
+      std::string value;
+      status = db->Get(read_options, k1, &value);
+      if (status.ok()) {
+        const auto it = model.find(k1);
+        if (it == model.end() || it->second != value) {
+          return Fail("Get: value disagrees with reference model");
+        }
+        out << "GET " << k1 << " => " << value << "\n";
+      } else if (status.IsNotFound()) {
+        if (model.find(k1) != model.end()) {
+          return Fail("Get: NotFound but key exists in reference model");
+        }
+      } else {
+        return Fail("Get", status);
+      }
+    } else if (op < 85) {
+      status = db->Delete(write_options, k1);
+      if (!status.ok()) {
+        return Fail("Delete", status);
+      }
+      {
+        std::string dummy;
+        const leveldb::Status g = db->Get(read_options, k1, &dummy);
+        if (!g.IsNotFound()) {
+          return Fail("Delete: key still visible to Get (expected NotFound)", g);
+        }
+      }
+      if (const auto it = model.find(k1); it != model.end()) {
+        model.erase(it);
+      }
+    } else if (op < 95) {
+      const std::string& start_key = std::min(k1, k2);
+      const std::string& end_key = std::max(k1, k2);
+      const auto expected = ModelRangeScan(model, start_key, end_key);
+      std::vector<std::pair<std::string, std::string>> scan_result;
+      status = db->Scan(read_options, start_key, end_key, &scan_result);
+      if (!status.ok()) {
+        return Fail("Scan", status);
+      }
+      if (scan_result != expected) {
+        return Fail("Scan: result does not match reference [start,end) slice");
+      }
+      if (!IsStrictlySorted(scan_result)) {
+        return Fail("Scan: keys not strictly increasing");
+      }
+      for (const auto& p : scan_result) {
+        if (p.first < start_key || p.first >= end_key) {
+          return Fail("Scan: key outside [start, end) half-open range");
+        }
+        std::string g;
+        const leveldb::Status gs = db->Get(read_options, p.first, &g);
+        if (!gs.ok() || g != p.second) {
+          return Fail("Scan vs Get: pair must match Get(key)", gs);
+        }
+      }
+      out << "SCAN [" << start_key << ", " << end_key << ")";
+      for (const auto& p : scan_result) {
+        out << " " << p.first << "=>" << p.second;
+      }
+      out << "\n";
+    } else if (op < 99) {
+      const std::string& start_key = std::min(k1, k2);
+      const std::string& end_key = std::max(k1, k2);
+      std::vector<std::string> removed;
+      ModelDeleteRangeInPlace(&model, start_key, end_key, &removed);
+      status = db->DeleteRange(write_options, start_key, end_key);
+      if (!status.ok()) {
+        return Fail("DeleteRange", status);
+      }
+      for (const std::string& k : removed) {
+        std::string d;
+        const leveldb::Status dgs = db->Get(read_options, k, &d);
+        if (!dgs.IsNotFound()) {
+          return Fail("DeleteRange: in-range key still visible to Get (expected NotFound)", dgs);
+        }
+      }
+    } else {
+      status = db->ForceFullCompaction();
+      if (!status.ok()) {
+        return Fail("ForceFullCompaction", status);
+      }
+      for (int ki = 1; ki <= 10000; ++ki) {
+        const std::string k = "key" + std::to_string(ki);
+        std::string gv;
+        const leveldb::Status gs = db->Get(read_options, k, &gv);
+        const auto mit = model.find(k);
+        if (mit == model.end()) {
+          if (!gs.IsNotFound()) {
+            return Fail("After ForceFullCompaction: key should be absent (model)", gs);
+          }
+        } else {
+          if (!gs.ok() || gv != mit->second) {
+            return Fail("After ForceFullCompaction: Get disagrees with model", gs);
+          }
+        }
+      }
+    }
+  }
 
   delete db;
-  std::cout << "PASSED\n";
-}
+  out.close();
 
-// -------------------------------------------------------
-// MAIN
-// -------------------------------------------------------
-int main() {
-  std::cout << "===========================================\n";
-  std::cout << "   Integration Test Suite\n";
-  std::cout << "===========================================\n";
-
-  Test_Scan_Then_DeleteRange_Then_Scan();
-  Test_DeleteRange_Then_Put_Inside_Range();
-  Test_Scan_Survives_Compaction();
-  Test_DeleteRange_Compaction_Scan();
-  Test_Full_Workflow();
-  Test_Interleaved_Puts_And_DeleteRanges();
-  Test_Multiple_DeleteRanges_Then_Compaction();
-  Test_Scan_Across_Memory_And_Disk();
-  Test_Compaction_Stats_Consistency();
-  Test_Rapid_Interleaving();
-
-  std::cout << "\n===========================================\n";
-  std::cout << "   ALL INTEGRATION TESTS PASSED\n";
-  std::cout << "===========================================\n";
+  if (write_mode) {
+    std::cout << "Wrote " << output_path << "\n";
+  }
+  // stdout only — not written to out.txt. `make test` runs `sample
+  // --concurrent` and expects the last two lines to be `ST: OK` then
+  // `RACE: OK` after both stages succeed.
+  if (do_concurrent && !write_mode) {
+    const int rrc = RunConcurrentRaceTest(false);
+    if (rrc != 0) {
+      return rrc;
+    }
+    std::cout << "ST: OK" << std::endl;
+    std::cout << "RACE: OK" << std::endl;
+    return 0;
+  }
+  std::cout << "ST: OK" << std::endl;
+  std::cout << "RACE: skip" << std::endl;
   return 0;
 }
