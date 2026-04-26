@@ -518,9 +518,9 @@ if(LEVELDB_INSTALL)
   )
 endif(LEVELDB_INSTALL)
 
-add_executable(test_rangescan test_rangescan.cc)
-target_link_libraries(test_rangescan leveldb)
-add_executable(test_delete_range test_delete_range.cc)
-target_link_libraries(test_delete_range leveldb)
-add_executable(test_compaction test_compaction.cc)
-target_link_libraries(test_compaction leveldb)
+add_executable(test_scan test_rangescan.cc)
+target_link_libraries(test_scan leveldb)
+
+
+add_executable(test_integration2 test_integration2.cc)
+target_link_libraries(test_integration2 leveldb)

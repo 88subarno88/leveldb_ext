@@ -9,7 +9,6 @@
 #include <deque>
 #include <set>
 #include <string>
-#include <vector>
 
 #include "db/dbformat.h"
 #include "db/log_writer.h"
@@ -30,6 +29,7 @@ class VersionSet;
 class DBImpl : public DB {
  public:
   DBImpl(const Options& options, const std::string& dbname);
+
   DBImpl(const DBImpl&) = delete;
   DBImpl& operator=(const DBImpl&) = delete;
 
@@ -39,15 +39,18 @@ class DBImpl : public DB {
   Status Put(const WriteOptions&, const Slice& key,
              const Slice& value) override;
   Status Delete(const WriteOptions&, const Slice& key) override;
-  Status DeleteRange(const WriteOptions& options,const Slice& startkey,const Slice& endkey) override;
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
-  Status ForceFullCompaction(CompactionReport* report = nullptr) override;
   Status Scan(const ReadOptions& options,
               const Slice& start_key,
               const Slice& end_key,
               std::vector<std::pair<std::string, std::string>>* result) override;
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
+
+  Status DeleteRange(const WriteOptions& options, const Slice& start_key,
+                     const Slice& end_key) override;
+  Status ForceFullCompaction() override;
+
   Iterator* NewIterator(const ReadOptions&) override;
   const Snapshot* GetSnapshot() override;
   void ReleaseSnapshot(const Snapshot* snapshot) override;
@@ -81,14 +84,17 @@ class DBImpl : public DB {
   friend class DB;
   struct CompactionState;
   struct Writer;
-  struct RangeDeletion {
-    std::string startkey;  // lower bound
-    std::string endkey;    //upper bound
-  
-    RangeDeletion(const std::string& s, const std::string& e)
-        : startkey(s), endkey(e) {}
-};
 
+  // Stores active range deletions, checked during compaction
+  struct RangeDeletion {
+    std::string start_key;
+    std::string end_key;
+    RangeDeletion(const std::string& s, const std::string& e)
+        : start_key(s), end_key(e) {}
+  };
+  bool IsKeyInRangeDeletion(const Slice& user_key);
+  std::vector<RangeDeletion> range_deletions_ ;
+  
   // Information for a manual compaction
   struct ManualCompaction {
     int level;
@@ -108,16 +114,11 @@ class DBImpl : public DB {
       this->bytes_read += c.bytes_read;
       this->bytes_written += c.bytes_written;
     }
-    
+
     int64_t micros;
     int64_t bytes_read;
     int64_t bytes_written;
   };
-
-  // void CollectCompactionStats(int level,
-  //                             const CompactionStats& before,
-  //                             CompactionReport* report);
-
 
   Iterator* NewInternalIterator(const ReadOptions&,
                                 SequenceNumber* latest_snapshot,
@@ -190,9 +191,7 @@ class DBImpl : public DB {
 
   // State below is protected by mutex_
   port::Mutex mutex_;
-  std::vector<RangeDeletion> range_deletions_ GUARDED_BY(mutex_);
   std::atomic<bool> shutting_down_;
-  bool IsKeyInRangeDeletion(const Slice& user_key) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   port::CondVar background_work_finished_signal_ GUARDED_BY(mutex_);
   MemTable* mem_;
   MemTable* imm_ GUARDED_BY(mutex_);  // Memtable being compacted

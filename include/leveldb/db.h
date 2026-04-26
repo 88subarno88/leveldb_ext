@@ -9,14 +9,10 @@
 #include <cstdio>
 #include <vector>    
 #include <utility>
-#include <cstdint>
-#include <cstdio>
-#include <string>
 
 #include "leveldb/export.h"
 #include "leveldb/iterator.h"
 #include "leveldb/options.h"
-
 
 namespace leveldb {
 
@@ -78,11 +74,6 @@ class LEVELDB_EXPORT DB {
   // Note: consider setting options.sync = true.
   virtual Status Delete(const WriteOptions& options, const Slice& key) = 0;
 
-  //DeleteRange removes all key-value pairs in the half-open interval
-  // [start_key, end_key). Keys are not immediately removed from SSTables 
-  // they are dropped during the next compaction of affected files.
-  virtual Status DeleteRange(const WriteOptions& options,const Slice& startkey,const Slice& endkey) = 0;
-
   // Apply the specified updates to the database.
   // Returns OK on success, non-OK on failure.
   // Note: consider setting options.sync = true.
@@ -124,6 +115,14 @@ class LEVELDB_EXPORT DB {
   // use "snapshot" after this call.
   virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
 
+  // DeleteRange removes all key-value pairs in [start_key, end_key).
+  virtual Status DeleteRange(const WriteOptions& options,
+    const Slice& start_key,
+    const Slice& end_key) = 0;
+
+// ForceFullCompaction triggers synchronous full compaction across all levels.
+virtual Status ForceFullCompaction() = 0;
+
   // DB implementations can export properties about their state
   // via this method.  If "property" is a valid property understood by this
   // DB implementation, fills "*value" with its current value and returns
@@ -164,65 +163,7 @@ class LEVELDB_EXPORT DB {
   // Therefore the following call will compact the entire database:
   //    db->CompactRange(nullptr, nullptr);
   virtual void CompactRange(const Slice* begin, const Slice* end) = 0;
-
-// CompactionReport holds statistics collected during ForceFullCompaction().
-struct CompactionReport {
-  int     num_compactions    = 0;   // number of compaction rounds executed
-  int     total_input_files  = 0;   // total SSTable files read as input
-  int     total_output_files = 0;   // total SSTable files written as output
-  int64_t bytes_read         = 0;   // total bytes read across all compactions
-  int64_t bytes_written      = 0;   // total bytes written across all compactions
-
-  void Print() const {
-    printf(
-      "\n========================================\n"
-      "   ForceFullCompaction Statistics\n"
-      "========================================\n"
-      "  Compaction rounds executed : %d\n"
-      "  Total input  files         : %d\n"
-      "  Total output files         : %d\n"
-      "  Total bytes read           : %s\n"
-      "  Total bytes written        : %s\n"
-      "========================================\n\n",
-      num_compactions,
-      total_input_files,
-      total_output_files,
-      FormatBytes(bytes_read).c_str(),
-      FormatBytes(bytes_written).c_str()
-    );
-  }
-
-  // format bytes into human-readable string (KB/MB/GB)
-  static std::string FormatBytes(int64_t bytes) {
-    const char* units[] = {"B", "KB", "MB", "GB"};
-    int i = 0;
-    double size = bytes;
-
-    // Divide by 1024 until we find the right unit, capping at GB (index 3)
-    while (size >= 1024 && i < 3) {
-      size /= 1024;
-      i++;
-    }
-
-    char buf[64];
-    if (i == 0) {
-      snprintf(buf, sizeof(buf), "%lld B", (long long)bytes);
-    } else {
-      snprintf(buf, sizeof(buf), "%.2f %s", size, units[i]);
-    }
-    
-    return std::string(buf);
-  }
 };
-
-// ForceFullCompaction triggers a synchronous full compaction of the database.
-// Iterates from Level 0 to the deepest level, compacting each in sequence.
-// Foreground reads and writes may be blocked until this completes.
-// Compaction statistics are collected and printed when done.
-// In db.h — replace the above with:
-virtual Status ForceFullCompaction(CompactionReport* report = nullptr) = 0;
-};
-
 
 // Destroy the contents of the specified database.
 // Be very careful using this method.
@@ -238,8 +179,6 @@ LEVELDB_EXPORT Status DestroyDB(const std::string& name,
 // on a database that contains important information.
 LEVELDB_EXPORT Status RepairDB(const std::string& dbname,
                                const Options& options);
-
-
 
 }  // namespace leveldb
 
